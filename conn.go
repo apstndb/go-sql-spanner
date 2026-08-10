@@ -1094,15 +1094,20 @@ func (c *conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 	// Remove the ExecOptions once all statements in the SQL string have been executed.
 	defer func() { c.tempExecOptions = nil }()
 
-	ok, statements, _ := c.parser.Split(query)
+	statements, splitErr := c.parser.SplitStatements(query)
+	isMulti := splitErr == nil && len(statements) > 1
 	if c.tempExecOptions != nil && c.tempExecOptions.QueryMetadata != nil {
-		c.tempExecOptions.QueryMetadata.IsMulti = ok
+		c.tempExecOptions.QueryMetadata.IsMulti = isMulti
 	}
 	var rows driver.Rows
 	var err error
-	if ok {
+	if isMulti {
 		rows, err = queryMultiple(ctx, c, statements, args)
+	} else if splitErr == nil && len(statements) == 1 {
+		rows, err = c.querySingle(ctx, statements[0] /* isPartOfMultiStatementString = */, false, args)
 	} else {
+		// Splitting is best effort. Preserve the existing single-statement path on failure
+		// so that later parsing or Spanner can determine whether the SQL is valid.
 		rows, err = c.querySingle(ctx, query /* isPartOfMultiStatementString = */, false, args)
 	}
 	return rows, checkAndEnrichError(c.isPostgreSQL(), err)

@@ -3241,6 +3241,9 @@ func TestSplit(t *testing.T) {
 			input: "select * from my_table\n;\n",
 		},
 		{
+			input: "select * from my_table; /* unterminated",
+		},
+		{
 			input:   "begin; select * from my_table",
 			want:    true,
 			wantRes: []string{"begin", " select * from my_table"},
@@ -3452,11 +3455,151 @@ func TestSplit(t *testing.T) {
 						if g, w := res, test.wantRes; !reflect.DeepEqual(g, w) {
 							t.Errorf("result mismatch\n Got: %v\nWant: %v", g, w)
 						}
-					} else if test.wantErr && err == nil {
-						t.Error("missing expected error")
+					}
+					if test.wantErr {
+						if err == nil {
+							t.Error("missing expected error")
+						}
+					} else if err != nil {
+						t.Errorf("unexpected error: %v", err)
 					}
 				})
 			}
+		}
+	}
+}
+
+func TestSplitStatements(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		input   string
+		dialect databasepb.DatabaseDialect
+		want    []string
+		wantErr bool
+	}{
+		{
+			name:  "empty",
+			input: "",
+			want:  []string{""},
+		},
+		{
+			name:  "single without terminator",
+			input: "select * from my_table",
+			want:  []string{"select * from my_table"},
+		},
+		{
+			name:  "single with terminator",
+			input: "select * from my_table;",
+			want:  []string{"select * from my_table"},
+		},
+		{
+			name:  "single with trailing whitespace and comment",
+			input: "select * from my_table; \n-- trailing comment",
+			want:  []string{"select * from my_table"},
+		},
+		{
+			name:  "single with trailing block comment",
+			input: "select * from my_table; /* trailing comment */",
+			want:  []string{"select * from my_table"},
+		},
+		{
+			name:  "multiple",
+			input: "begin; select * from my_table; commit;",
+			want:  []string{"begin", " select * from my_table", " commit"},
+		},
+		{
+			name:  "empty statements",
+			input: ";;",
+			want:  []string{"", ""},
+		},
+		{
+			name:  "semicolon in string literal",
+			input: "select 'Hello;World!';",
+			want:  []string{"select 'Hello;World!'"},
+		},
+		{
+			name:  "semicolon in comment",
+			input: "-- Comment;\nselect 1;",
+			want:  []string{"-- Comment;\nselect 1"},
+		},
+		{
+			name:    "semicolon in PostgreSQL quoted identifier",
+			input:   `select * from "my;table";`,
+			dialect: databasepb.DatabaseDialect_POSTGRESQL,
+			want:    []string{`select * from "my;table"`},
+		},
+		{
+			name:    "semicolon in PostgreSQL dollar-quoted string",
+			input:   "select $tag$Hello;World!$tag$; select 1",
+			dialect: databasepb.DatabaseDialect_POSTGRESQL,
+			want:    []string{"select $tag$Hello;World!$tag$", " select 1"},
+		},
+		{
+			name:    "unclosed GoogleSQL literal",
+			input:   "select 'Hello;World!",
+			dialect: databasepb.DatabaseDialect_GOOGLE_STANDARD_SQL,
+			wantErr: true,
+		},
+		{
+			name:    "unclosed GoogleSQL trailing block comment",
+			input:   "select 1; /* unterminated",
+			dialect: databasepb.DatabaseDialect_GOOGLE_STANDARD_SQL,
+			wantErr: true,
+		},
+		{
+			name:    "unclosed PostgreSQL trailing block comment",
+			input:   "select 1; /* unterminated",
+			dialect: databasepb.DatabaseDialect_POSTGRESQL,
+			wantErr: true,
+		},
+		{
+			name:    "unclosed nested PostgreSQL trailing block comment",
+			input:   "select 1; /* outer /* inner */",
+			dialect: databasepb.DatabaseDialect_POSTGRESQL,
+			wantErr: true,
+		},
+		{
+			name:    "closed nested PostgreSQL trailing block comment",
+			input:   "select 1; /* outer /* inner */ outer */",
+			dialect: databasepb.DatabaseDialect_POSTGRESQL,
+			want:    []string{"select 1"},
+		},
+		{
+			name:    "unclosed PostgreSQL dollar-quoted string",
+			input:   "select $tag$Hello;World!",
+			dialect: databasepb.DatabaseDialect_POSTGRESQL,
+			wantErr: true,
+		},
+	}
+	for _, dialect := range []databasepb.DatabaseDialect{
+		databasepb.DatabaseDialect_GOOGLE_STANDARD_SQL,
+		databasepb.DatabaseDialect_POSTGRESQL,
+	} {
+		parser, err := NewStatementParser(dialect, 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, test := range tests {
+			if test.dialect != databasepb.DatabaseDialect_DATABASE_DIALECT_UNSPECIFIED && test.dialect != dialect {
+				continue
+			}
+			t.Run(fmt.Sprintf("%v/%s", dialect, test.name), func(t *testing.T) {
+				got, err := parser.SplitStatements(test.input)
+				if test.wantErr {
+					if err == nil {
+						t.Fatal("missing expected error")
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(got, test.want) {
+					t.Errorf("statements mismatch\n Got: %#v\nWant: %#v", got, test.want)
+				}
+			})
 		}
 	}
 }

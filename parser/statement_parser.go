@@ -314,6 +314,11 @@ func (p *StatementParser) ParseParameters(sql string) (string, []string, map[str
 // /*@ hint_key=hint_value[, hint_key2=hint_value2[,...]] */
 // The skipPgHints argument indicates whether those comments should also be skipped or not.
 func (p *StatementParser) skipWhitespacesAndComments(sql []byte, pos int, skipPgHints bool) int {
+	pos, _ = p.skipWhitespacesAndCommentsWithError(sql, pos, skipPgHints)
+	return pos
+}
+
+func (p *StatementParser) skipWhitespacesAndCommentsWithError(sql []byte, pos int, skipPgHints bool) (int, error) {
 	for pos < len(sql) {
 		c := sql[pos]
 		if isMultibyte(c) {
@@ -331,14 +336,18 @@ func (p *StatementParser) skipWhitespacesAndComments(sql []byte, pos int, skipPg
 				// This is a PostgreSQL hint, and we should not skip it.
 				break
 			}
-			pos = p.skipMultiLineComment(sql, pos)
+			var closed bool
+			pos, closed = p.skipMultiLineCommentWithStatus(sql, pos)
+			if !closed {
+				return pos, spanner.ToSpannerError(status.Errorf(codes.InvalidArgument, "SQL statement contains an unclosed comment: %s", string(sql)))
+			}
 		} else if !isSpace(c) {
 			break
 		} else {
 			pos++
 		}
 	}
-	return pos
+	return pos, nil
 }
 
 // Skips the next character, quoted literal, quoted identifier or comment in
@@ -404,6 +413,11 @@ func (p *StatementParser) skipSingleLineComment(sql []byte, pos int) int {
 }
 
 func (p *StatementParser) skipMultiLineComment(sql []byte, pos int) int {
+	pos, _ = p.skipMultiLineCommentWithStatus(sql, pos)
+	return pos
+}
+
+func (p *StatementParser) skipMultiLineCommentWithStatus(sql []byte, pos int) (int, bool) {
 	// Skip '/*'.
 	pos = pos + 2
 	level := 1
@@ -420,10 +434,10 @@ func (p *StatementParser) skipMultiLineComment(sql []byte, pos int) int {
 			if p.supportsNestedComments() {
 				level--
 				if level == 0 {
-					return pos + 2
+					return pos + 2, true
 				}
 			} else {
-				return pos + 2
+				return pos + 2, true
 			}
 		} else if p.supportsNestedComments() {
 			if sql[pos] == '/' && len(sql) > pos+1 && sql[pos+1] == '*' {
@@ -432,7 +446,7 @@ func (p *StatementParser) skipMultiLineComment(sql []byte, pos int) int {
 		}
 		pos++
 	}
-	return pos
+	return pos, false
 }
 
 // skipQuoted skips a quoted string at the given position in the sql string and
@@ -1001,7 +1015,36 @@ func (p *StatementParser) split(sql string, sep byte) (bool, []string, error) {
 	if firstIndex == len(tokens)-1 {
 		return false, nil, nil
 	}
+	// Preserve Split's historical best-effort handling of trailing comments.
+	// SplitStatements validates comments that it would otherwise discard; see issue #840.
+	statements, err := p.splitStatements(sql, sep, false)
+	if err != nil {
+		return false, nil, err
+	}
+	if len(statements) <= 1 {
+		return false, nil, nil
+	}
+	return true, statements, nil
+}
 
+// SplitStatements splits a SQL string into statements separated by semicolons.
+// Unlike Split, it also returns the statement when the SQL string contains only
+// one statement. Separating semicolons are not included in the returned strings.
+// Whitespaces and comments after the last semicolon are ignored.
+// It returns an error if splitting encounters an unclosed literal or trailing block comment.
+//
+// Empty input returns a slice containing one empty string.
+func (p *StatementParser) SplitStatements(sql string) ([]string, error) {
+	return p.splitStatements(sql, ';', true)
+}
+
+func (p *StatementParser) splitStatements(sql string, sep byte, validateTrailingComments bool) ([]string, error) {
+	// Return early if the string does not contain the separator.
+	if strings.IndexByte(sql, sep) == -1 {
+		return []string{sql}, nil
+	}
+
+	tokens := []byte(sql)
 	res := make([]string, 0)
 	parser := &simpleParser{sql: tokens, statementParser: p}
 	startPos := 0
@@ -1022,18 +1065,23 @@ func (p *StatementParser) split(sql string, sep byte) (bool, []string, error) {
 			// Skip whitespaces / comments etc. and check if we are at the end of the SQL string.
 			// This prevents that an empty statement is added to the end of the slice if there are only whitespaces
 			// after the last semicolon.
-			parser.skipWhitespacesAndComments()
-			if parser.pos >= len(parser.sql) {
-				if len(res) == 1 {
-					return false, nil, nil
+			if validateTrailingComments {
+				var err error
+				parser.pos, err = p.skipWhitespacesAndCommentsWithError(parser.sql, parser.pos, true)
+				if err != nil {
+					return nil, err
 				}
-				return true, res, nil
+			} else {
+				parser.skipWhitespacesAndComments()
+			}
+			if parser.pos >= len(parser.sql) {
+				return res, nil
 			}
 			continue
 		}
 		newPos, err := p.skip(parser.sql, parser.pos)
 		if err != nil {
-			return false, nil, err
+			return nil, err
 		}
 		parser.pos = newPos
 	}
@@ -1041,10 +1089,10 @@ func (p *StatementParser) split(sql string, sep byte) (bool, []string, error) {
 		// This means that the SQL string contains one or more semicolons, but that all of them
 		// are inside quoted literals, quoted identifiers or comments. This again means that there
 		// is only one statement in the string.
-		return false, nil, nil
+		return []string{sql}, nil
 	}
 
 	// The last statement does not need to be terminated by a semicolon, so we add it here.
 	res = append(res, sql[startPos:])
-	return true, res, nil
+	return res, nil
 }

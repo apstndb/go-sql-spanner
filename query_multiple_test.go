@@ -612,9 +612,10 @@ func TestMultipleDdlStatements(t *testing.T) {
 		},
 	})
 
+	metadata := &QueryMetadata{}
 	r, err := db.QueryContext(ctx, "create table singers (id int64 primary key, name string(max));"+
 		"create table albums (id int64 primary key, title string(max));"+
-		"create table tracks (id int64 primary key, title string(max));")
+		"create table tracks (id int64 primary key, title string(max));", ExecOptions{QueryMetadata: metadata})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -622,6 +623,9 @@ func TestMultipleDdlStatements(t *testing.T) {
 
 	if err := consumeResults(t, r, []expectedResults{{numRows: 0}, {numRows: 0}, {numRows: 0}}); err != nil {
 		t.Fatal(err)
+	}
+	if !metadata.IsMulti {
+		t.Fatal("multiple DDL statements reported as a single statement")
 	}
 	requests := server.TestDatabaseAdmin.Reqs()
 	if g, w := len(requests), 1; g != w {

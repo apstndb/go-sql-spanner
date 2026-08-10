@@ -893,26 +893,76 @@ func TestDropDatabase(t *testing.T) {
 func TestDDLUsingQueryContext(t *testing.T) {
 	t.Parallel()
 
-	db, server, teardown := setupTestDBConnection(t)
-	defer teardown()
-	var expectedResponse = &emptypb.Empty{}
-	anyMsg, _ := anypb.New(expectedResponse)
-	server.TestDatabaseAdmin.SetResps([]proto.Message{
-		&longrunningpb.Operation{
-			Done:   true,
-			Result: &longrunningpb.Operation_Response{Response: anyMsg},
-			Name:   "test-operation",
+	tests := []struct {
+		name    string
+		dialect databasepb.DatabaseDialect
+		query   string
+		want    string
+	}{
+		{
+			name:    "GoogleSQL",
+			dialect: databasepb.DatabaseDialect_GOOGLE_STANDARD_SQL,
+			query:   "CREATE TABLE Foo (Bar STRING(100));",
+			want:    "CREATE TABLE Foo (Bar STRING(100))",
 		},
-	})
-	ctx := context.Background()
+		{
+			name:    "GoogleSQL with trailing block comment",
+			dialect: databasepb.DatabaseDialect_GOOGLE_STANDARD_SQL,
+			query:   "CREATE TABLE Foo (Bar STRING(100)); /* trailing comment */",
+			want:    "CREATE TABLE Foo (Bar STRING(100))",
+		},
+		{
+			name:    "GoogleSQL with unclosed trailing block comment",
+			dialect: databasepb.DatabaseDialect_GOOGLE_STANDARD_SQL,
+			query:   "CREATE TABLE Foo (Bar STRING(100)); /* unterminated",
+			want:    "CREATE TABLE Foo (Bar STRING(100)); /* unterminated",
+		},
+		{
+			name:    "PostgreSQL",
+			dialect: databasepb.DatabaseDialect_POSTGRESQL,
+			query:   "CREATE TABLE Foo (Bar varchar(100));",
+			want:    "CREATE TABLE Foo (Bar varchar(100))",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db, server, teardown := setupTestDBConnectionWithDialect(t, test.dialect)
+			defer teardown()
+			anyMsg, _ := anypb.New(&emptypb.Empty{})
+			server.TestDatabaseAdmin.SetResps([]proto.Message{
+				&longrunningpb.Operation{
+					Done:   true,
+					Result: &longrunningpb.Operation_Response{Response: anyMsg},
+					Name:   "test-operation",
+				},
+			})
+			metadata := &QueryMetadata{}
 
-	// DDL statements should be able to use QueryContext.
-	if it, err := db.QueryContext(ctx, "CREATE TABLE Foo (Bar STRING(100))"); err != nil {
-		t.Fatal(err)
-	} else {
-		if it.Next() {
-			t.Fatalf("DDL should not return any rows")
-		}
+			// DDL statements should be able to use QueryContext with a terminating semicolon.
+			it, err := db.QueryContext(context.Background(), test.query, ExecOptions{QueryMetadata: metadata})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer silentClose(it)
+			if it.Next() {
+				t.Fatal("DDL should not return any rows")
+			}
+			if metadata.IsMulti {
+				t.Fatal("single DDL statement reported as multi-statement")
+			}
+
+			requests := server.TestDatabaseAdmin.Reqs()
+			if g, w := len(requests), 1; g != w {
+				t.Fatalf("requests count mismatch\nGot: %v\nWant: %v", g, w)
+			}
+			req, ok := requests[0].(*databasepb.UpdateDatabaseDdlRequest)
+			if !ok {
+				t.Fatalf("request type mismatch, got %T", requests[0])
+			}
+			if g, w := req.GetStatements(), []string{test.want}; !reflect.DeepEqual(g, w) {
+				t.Fatalf("statements mismatch\n Got: %#v\nWant: %#v", g, w)
+			}
+		})
 	}
 }
 
